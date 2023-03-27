@@ -32,7 +32,7 @@ const int M = 327660;
 const int N = 1536;
 const int K = 512;
 
-const int num_threads = 1024;
+const int num_threads = 16;
 const int smem = K * 16;
 
 __global__ void wmma_kernel(half* a, half* b, float* c){
@@ -59,7 +59,7 @@ __global__ void wmma_kernel(half* a, half* b, float* c){
     for(int m=1; m<(M/16); m++){
 
      pipeline.producer_acquire();
-     cuda::memcpy_async(group,&SMEM[smem],&a[m*K*16],sizeof(half)*K*16,pipeline);
+     cuda::memcpy_async(group,&SMEM[(m%2)?smem:0],&a[m*K*16],sizeof(half)*K*16,pipeline);
      pipeline.producer_commit();
 
      pipeline.consumer_wait();
@@ -67,7 +67,7 @@ __global__ void wmma_kernel(half* a, half* b, float* c){
       for(int j=0; j<work_per_warp; j++){
        wmma::fill_fragment(frag_c,0.0f);
        for(int k=0; k<(K/WMMA_K); k++){
-        wmma::load_matrix_sync(frag_a,&SMEM[(i*K*WMMA_M) + (k*WMMA_K)],K);
+        wmma::load_matrix_sync(frag_a,&SMEM[((i*K*WMMA_M) + (k*WMMA_K)) + (m%2)?0:smem],K);
         wmma::load_matrix_sync(frag_b,&b[(j*WMMA_N) + work_per_warp*warp_id*WMMA_N + (k*WMMA_K*N)],N);
   
         wmma::mma_sync(frag_c,frag_a,frag_b,frag_c);

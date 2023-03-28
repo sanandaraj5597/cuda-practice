@@ -28,18 +28,20 @@ const int WMMA_M = 16;
 const int WMMA_N = 16;
 const int WMMA_K = 16;
 
-const int M = 327660;
+//const int M = 327660;
+const int M = 327664; //To make it a closest multiple of 16!
 const int N = 1536;
 const int K = 512;
 
-const int num_threads = 16;
+const int num_threads = 512;
 const int smem = K * 16;
 
 __global__ void wmma_kernel(half* a, half* b, float* c){
 
    __shared__ half SMEM[2*smem];
    int warp_id = threadIdx.x/32;
-   int work_per_warp = N/(WMMA_N*32);
+   int num_warps = num_threads/32;
+   int work_per_warp = N/(WMMA_N*num_warps);
 
    wmma::fragment<wmma::matrix_a,WMMA_M,WMMA_N,WMMA_K,half,wmma::row_major> frag_a;
    wmma::fragment<wmma::matrix_b,WMMA_M,WMMA_N,WMMA_K,half,wmma::row_major> frag_b;
@@ -51,11 +53,14 @@ __global__ void wmma_kernel(half* a, half* b, float* c){
    __shared__ cuda::pipeline_shared_state<scope, stages_count> shared_state;
    auto pipeline = cuda::make_pipeline(group, &shared_state);
 
-   pipeline.producer_acquire();
-   cuda::memcpy_async(group,&SMEM[0],&a[0],sizeof(half)*K*16,pipeline);
-   pipeline.producer_commit();
-
    for(int it=0; it<NUM_ITERS; it++){
+
+    //Warm the pipeline
+    pipeline.producer_acquire();
+    cuda::memcpy_async(group,&SMEM[0],&a[0],sizeof(half)*K*16,pipeline);
+    pipeline.producer_commit();
+
+    //Run the pipeline
     for(int m=1; m<(M/16); m++){
 
      pipeline.producer_acquire();
@@ -72,11 +77,25 @@ __global__ void wmma_kernel(half* a, half* b, float* c){
   
         wmma::mma_sync(frag_c,frag_a,frag_b,frag_c);
        }
-      wmma::store_matrix_sync(&c[(i*WMMA_M*N)+(m*16*N)+((j+(warp_id*work_per_warp))*WMMA_N)],frag_c,N,wmma::mem_row_major);
+      wmma::store_matrix_sync(&c[(i*WMMA_M*N)+((m-1)*16*N)+((j+(warp_id*work_per_warp))*WMMA_N)],frag_c,N,wmma::mem_row_major);
       }
      }
      pipeline.consumer_release();
     }
+
+    //Drain the pipeline
+    pipeline.consumer_wait();
+    for(int j=0; j<work_per_warp; j++){
+     wmma::fill_fragment(frag_c,0.0f);
+     for(int k=0; k<(K/WMMA_K); k++){
+      wmma::load_matrix_sync(frag_a,&SMEM[(k*WMMA_K) + ((M/16) % 2)?0:smem],K);
+      wmma::load_matrix_sync(frag_b,&b[(j*WMMA_N) + (work_per_warp*warp_id*WMMA_N) + (k*WMMA_K*N)],N);
+
+      wmma::mma_sync(frag_c,frag_a,frag_b,frag_c);
+     }
+     wmma::store_matrix_sync(&c[(((M/16)-1)*16*N) + ((j+(warp_id*work_per_warp))*WMMA_N)],frag_c,N,wmma::mem_row_major);
+    }
+    pipeline.consumer_release();
    }
 }
 
@@ -107,6 +126,10 @@ int main(){
  CUDA_CHECK_RETURN(cudaEventRecord(stop));
 
  cudaMemcpy(h_c, d_c, M*N*sizeof(float), cudaMemcpyDeviceToHost);
+
+ for(int i=0; i<M*N; i++)
+  if(h_c[i] != K)
+    printf("Error at: %d %f\n",i,h_c[i]);
 
  float elapsedTime;
  cudaEventElapsedTime(&elapsedTime, start, stop);
